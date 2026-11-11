@@ -5,8 +5,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 
-# Permissions hook logs (audit trail)
+# Permissions hook audit logs
 .agents/hooks/*.log
+.agents/hooks/*.log.*
 *.log
 
 # Claude Code local settings & environment overrides
@@ -19,7 +20,7 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Test & coverage
+# Test & coverage artifacts
 coverage/
 .vitest/
 tmp-verify-setup/

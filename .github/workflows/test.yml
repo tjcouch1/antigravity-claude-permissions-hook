@@ -30,7 +30,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Test setup installer in temporary workspace
+      - name: Verify setup installer in temporary workspace
         run: node scripts/setup.ts ./tmp-verify-setup
 
       - name: Run Vitest suite
