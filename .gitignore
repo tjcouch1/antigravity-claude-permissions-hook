@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-package-lock.json
 
 # Build & TypeScript outputs
 dist/
@@ -23,3 +22,4 @@ Thumbs.db
 # Test & coverage
 coverage/
 .vitest/
+tmp-verify-setup/

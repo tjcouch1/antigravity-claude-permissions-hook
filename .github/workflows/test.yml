@@ -2,20 +2,20 @@ name: Permissions Hook Test Suite
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
 
 jobs:
   test:
-    name: Test on ${{ matrix.os }} with Node ${{ matrix.node-version }}
+    name: Test on ${{ matrix.os }} (Node ${{ matrix.node-version }})
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, windows-latest ]
-        node-version: [ 20.x, 22.x ]
+        os: [ubuntu-latest, windows-latest]
+        node-version: [22.x, 24.x]
 
     steps:
       - name: Check out repository
@@ -25,13 +25,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
-      - name: Verify hook setup script
-        run: node scripts/setup.js
+      - name: Test setup installer in temporary workspace
+        run: node scripts/setup.ts ./tmp-verify-setup
 
-      - name: Run test suite via Vitest
+      - name: Run Vitest suite
         run: npm test
